@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "building-3d",
+      "runtimeExecutable": "/Users/wk/.bun/bin/bun",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "apps/building-3d",
+      "port": 3004
+    }
+  ]
+}

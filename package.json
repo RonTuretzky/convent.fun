@@ -1,0 +1,18 @@
+{
+  "name": "convent-fun",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "db:generate": "cd packages/db && bun run generate",
+    "db:migrate": "cd packages/db && bun run migrate",
+    "db:seed": "cd packages/db && bun run seed",
+    "db:studio": "cd packages/db && bun run studio"
+  },
+  "packageManager": "bun@1.3.12",
+  "devDependencies": {
+    "turbo": "^2.5.0"
+  }
+}
