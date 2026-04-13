@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useRef } from "react";
+import React, { useMemo } from "react";
 import * as THREE from "three";
 import { Text } from "@react-three/drei";
 import {
@@ -12,16 +12,21 @@ import {
   FLOOR_HEIGHT,
   WALL_THICKNESS,
 } from "./buildingData";
-import type { FloorDef, RoomDef } from "./buildingData";
+import type { FloorDef } from "./buildingData";
 
 const SLAB_THICKNESS = 0.25;
 const INTERIOR_WALL_THICKNESS = 0.15;
 
+// Gap between floors in the exploded stack view
+const FLOOR_GAP = FLOOR_HEIGHT * 0.8;
+// Total vertical spacing per floor slot
+const SLOT_HEIGHT = FLOOR_HEIGHT + FLOOR_GAP;
+
+// Floor order bottom to top
+const FLOOR_ORDER = ["LL", "1", "2", "R"];
+
 interface InteriorFloorsProps {
   selectedFloor: string | null;
-  showAllFloors: boolean;
-  opacity?: number;
-  isolateMode?: boolean;
   spreadView?: boolean;
 }
 
@@ -34,31 +39,19 @@ function createFloorTexture(width = 512, height = 512): THREE.CanvasTexture {
   canvas.height = height;
   const ctx = canvas.getContext("2d")!;
 
-  // Base fill
   ctx.fillStyle = "#3D2B1F";
   ctx.fillRect(0, 0, width, height);
 
-  // Plank parameters – planks run lengthwise (along canvas height)
-  const plankPixelWidth = Math.round((0.12 / 2) * width); // ~0.12m mapped loosely
+  const plankPixelWidth = Math.round((0.12 / 2) * width);
   const numPlanks = Math.ceil(width / plankPixelWidth);
-
-  const plankColors = [
-    "#3D2B1F",
-    "#35261A",
-    "#453022",
-    "#2E2016",
-    "#4A3528",
-    "#382A1D",
-  ];
+  const plankColors = ["#3D2B1F", "#35261A", "#453022", "#2E2016", "#4A3528", "#382A1D"];
 
   for (let i = 0; i < numPlanks; i++) {
     const x = i * plankPixelWidth;
-    // Pick a slightly varied base for each plank
     ctx.fillStyle = plankColors[i % plankColors.length];
     ctx.fillRect(x, 0, plankPixelWidth, height);
 
-    // Grain lines
-    ctx.strokeStyle = `rgba(0,0,0,0.08)`;
+    ctx.strokeStyle = "rgba(0,0,0,0.08)";
     ctx.lineWidth = 1;
     for (let g = 0; g < 8; g++) {
       const gx = x + Math.random() * plankPixelWidth;
@@ -68,7 +61,6 @@ function createFloorTexture(width = 512, height = 512): THREE.CanvasTexture {
       ctx.stroke();
     }
 
-    // Plank separator line
     ctx.strokeStyle = "rgba(0,0,0,0.25)";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -85,26 +77,16 @@ function createFloorTexture(width = 512, height = 512): THREE.CanvasTexture {
 }
 
 // ---------------------------------------------------------------------------
-// L-shaped slab geometry (two merged boxes via BufferGeometry merge)
+// L-shaped slab geometry
 // ---------------------------------------------------------------------------
 function createLShapedSlabGeometry(): THREE.BufferGeometry {
-  // The L-shape is the full rectangle minus the notch in the lower-left.
-  // We decompose it into two boxes:
-  //   Box A: the full-width strip from y=NOTCH_DEPTH to y=BUILDING_DEPTH
-  //   Box B: the strip from x=NOTCH_WIDTH to x=BUILDING_WIDTH, y=0 to y=NOTCH_DEPTH
-
   const boxA = new THREE.BoxGeometry(
-    BUILDING_WIDTH,
-    SLAB_THICKNESS,
-    BUILDING_DEPTH - NOTCH_DEPTH
+    BUILDING_WIDTH, SLAB_THICKNESS, BUILDING_DEPTH - NOTCH_DEPTH
   );
   boxA.translate(0, 0, (BUILDING_DEPTH - NOTCH_DEPTH) / 2 + NOTCH_DEPTH - BUILDING_DEPTH / 2);
-  // center-z of boxA in building coords = NOTCH_DEPTH + (BUILDING_DEPTH-NOTCH_DEPTH)/2 - BUILDING_DEPTH/2
 
   const boxB = new THREE.BoxGeometry(
-    BUILDING_WIDTH - NOTCH_WIDTH,
-    SLAB_THICKNESS,
-    NOTCH_DEPTH
+    BUILDING_WIDTH - NOTCH_WIDTH, SLAB_THICKNESS, NOTCH_DEPTH
   );
   boxB.translate(
     (BUILDING_WIDTH - NOTCH_WIDTH) / 2 + NOTCH_WIDTH - BUILDING_WIDTH / 2,
@@ -113,12 +95,13 @@ function createLShapedSlabGeometry(): THREE.BufferGeometry {
   );
 
   const merged = new THREE.BufferGeometry();
-  const geoms = [boxA, boxB];
   const positions: number[] = [];
   const normals: number[] = [];
   const uvs: number[] = [];
+  const indices: number[] = [];
+  let indexOffset = 0;
 
-  for (const g of geoms) {
+  for (const g of [boxA, boxB]) {
     const pos = g.getAttribute("position") as THREE.BufferAttribute;
     const norm = g.getAttribute("normal") as THREE.BufferAttribute;
     const uv = g.getAttribute("uv") as THREE.BufferAttribute;
@@ -127,127 +110,74 @@ function createLShapedSlabGeometry(): THREE.BufferGeometry {
       normals.push(norm.getX(i), norm.getY(i), norm.getZ(i));
       uvs.push(uv.getX(i), uv.getY(i));
     }
-  }
-
-  let indexOffset = 0;
-  const indices: number[] = [];
-  for (const g of geoms) {
     const idx = g.getIndex()!;
-    for (let i = 0; i < idx.count; i++) {
-      indices.push(idx.array[i] + indexOffset);
-    }
-    indexOffset += g.getAttribute("position").count;
+    for (let i = 0; i < idx.count; i++) indices.push(idx.array[i] + indexOffset);
+    indexOffset += pos.count;
+    g.dispose();
   }
 
   merged.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   merged.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
   merged.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   merged.setIndex(indices);
-
-  boxA.dispose();
-  boxB.dispose();
-
   return merged;
 }
 
 // ---------------------------------------------------------------------------
-// Room partition walls for a single floor
+// Room partition walls for a single floor (positioned locally at y=0)
 // ---------------------------------------------------------------------------
-function RoomWalls({
-  floor,
-  opacity,
-}: {
-  floor: FloorDef;
-  opacity: number;
-}) {
+function RoomWalls({ floor, opacity }: { floor: FloorDef; opacity: number }) {
   const wallHeight = FLOOR_HEIGHT - SLAB_THICKNESS;
   const halfW = BUILDING_WIDTH / 2;
   const halfD = BUILDING_DEPTH / 2;
 
   return (
-    <group position={[0, floor.elevation + SLAB_THICKNESS + wallHeight / 2, 0]}>
+    <group position={[0, SLAB_THICKNESS + wallHeight / 2, 0]}>
       {floor.rooms.map((room) => {
-        // Room coords are from building origin; convert to centered
         const cx = room.x - halfW;
         const cz = room.y - halfD;
-
-        // We draw the 4 walls of each room as thin boxes.
-        // Only draw walls that are interior (not on the building perimeter)
-        // to avoid z-fighting with exterior walls.
         const walls: React.ReactNode[] = [];
+        const mat = (
+          <meshStandardMaterial
+            color="#F5F0E8"
+            roughness={0.9}
+            transparent={opacity < 1}
+            opacity={opacity}
+          />
+        );
 
-        // Bottom wall (south edge of room) – along x at z = cz
         if (room.y > 0.5) {
           walls.push(
-            <mesh
-              key={`${room.id}-s`}
-              position={[cx + room.w / 2, 0, cz]}
-            >
+            <mesh key={`${room.id}-s`} position={[cx + room.w / 2, 0, cz]}>
               <boxGeometry args={[room.w, wallHeight, INTERIOR_WALL_THICKNESS]} />
-              <meshStandardMaterial
-                color="#F5F0E8"
-                roughness={0.9}
-                transparent={opacity < 1}
-                opacity={opacity}
-              />
+              {mat}
             </mesh>
           );
         }
-
-        // Top wall (north edge) – along x at z = cz + h
         if (room.y + room.h < BUILDING_DEPTH - 0.5) {
           walls.push(
-            <mesh
-              key={`${room.id}-n`}
-              position={[cx + room.w / 2, 0, cz + room.h]}
-            >
+            <mesh key={`${room.id}-n`} position={[cx + room.w / 2, 0, cz + room.h]}>
               <boxGeometry args={[room.w, wallHeight, INTERIOR_WALL_THICKNESS]} />
-              <meshStandardMaterial
-                color="#F5F0E8"
-                roughness={0.9}
-                transparent={opacity < 1}
-                opacity={opacity}
-              />
+              {mat}
             </mesh>
           );
         }
-
-        // Left wall (west edge) – along z at x = cx
         if (room.x > 0.5) {
           walls.push(
-            <mesh
-              key={`${room.id}-w`}
-              position={[cx, 0, cz + room.h / 2]}
-            >
+            <mesh key={`${room.id}-w`} position={[cx, 0, cz + room.h / 2]}>
               <boxGeometry args={[INTERIOR_WALL_THICKNESS, wallHeight, room.h]} />
-              <meshStandardMaterial
-                color="#F5F0E8"
-                roughness={0.9}
-                transparent={opacity < 1}
-                opacity={opacity}
-              />
+              {mat}
             </mesh>
           );
         }
-
-        // Right wall (east edge) – along z at x = cx + w
         if (room.x + room.w < BUILDING_WIDTH - 0.5) {
           walls.push(
-            <mesh
-              key={`${room.id}-e`}
-              position={[cx + room.w, 0, cz + room.h / 2]}
-            >
+            <mesh key={`${room.id}-e`} position={[cx + room.w, 0, cz + room.h / 2]}>
               <boxGeometry args={[INTERIOR_WALL_THICKNESS, wallHeight, room.h]} />
-              <meshStandardMaterial
-                color="#F5F0E8"
-                roughness={0.9}
-                transparent={opacity < 1}
-                opacity={opacity}
-              />
+              {mat}
             </mesh>
           );
         }
-
         return <React.Fragment key={room.id}>{walls}</React.Fragment>;
       })}
     </group>
@@ -255,19 +185,75 @@ function RoomWalls({
 }
 
 // ---------------------------------------------------------------------------
-// Room labels
+// Exterior wall outline (thin wire-frame-like outline of the L-shape)
+// ---------------------------------------------------------------------------
+function FloorOutline({ floor }: { floor: FloorDef }) {
+  const wallHeight = FLOOR_HEIGHT - SLAB_THICKNESS;
+  const halfW = BUILDING_WIDTH / 2;
+  const halfD = BUILDING_DEPTH / 2;
+  const t = WALL_THICKNESS * 0.4; // thinner outline walls
+
+  // L-shape perimeter segments: [startX, startZ, endX, endZ]
+  const segments: [number, number, number, number][] = [
+    // Bottom (south) from notch corner to right
+    [-halfW + NOTCH_WIDTH, -halfD, halfW, -halfD],
+    // Right (east)
+    [halfW, -halfD, halfW, halfD],
+    // Top (north)
+    [halfW, halfD, -halfW, halfD],
+    // Left main (west) from top to notch inner
+    [-halfW, halfD, -halfW, -halfD + NOTCH_DEPTH],
+    // Notch inner wall (horizontal)
+    [-halfW, -halfD + NOTCH_DEPTH, -halfW + NOTCH_WIDTH, -halfD + NOTCH_DEPTH],
+    // Notch left wall (vertical)
+    [-halfW + NOTCH_WIDTH, -halfD + NOTCH_DEPTH, -halfW + NOTCH_WIDTH, -halfD],
+  ];
+
+  return (
+    <group position={[0, SLAB_THICKNESS + wallHeight / 2, 0]}>
+      {segments.map(([x1, z1, x2, z2], i) => {
+        const dx = x2 - x1;
+        const dz = z2 - z1;
+        const len = Math.sqrt(dx * dx + dz * dz);
+        const cx = (x1 + x2) / 2;
+        const cz = (z1 + z2) / 2;
+        const angle = -Math.atan2(dz, dx);
+        // Determine if wall runs along X or Z
+        const isHoriz = Math.abs(dx) > Math.abs(dz);
+        return (
+          <mesh
+            key={i}
+            position={[cx, 0, cz]}
+            rotation={[0, angle, 0]}
+          >
+            <boxGeometry args={[len, wallHeight, t]} />
+            <meshStandardMaterial
+              color={floor.color}
+              roughness={0.7}
+              transparent
+              opacity={0.35}
+            />
+          </mesh>
+        );
+      })}
+    </group>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Room labels with square footage + colored floor tint
 // ---------------------------------------------------------------------------
 function RoomLabels({ floor }: { floor: FloorDef }) {
   const halfW = BUILDING_WIDTH / 2;
   const halfD = BUILDING_DEPTH / 2;
 
   return (
-    <group position={[0, floor.elevation + SLAB_THICKNESS + 0.3, 0]}>
+    <group position={[0, SLAB_THICKNESS + 0.3, 0]}>
       {floor.rooms.map((room) => {
         const cx = room.x + room.w / 2 - halfW;
         const cz = room.y + room.h / 2 - halfD;
         const label = room.sqft > 0
-          ? `${room.name}\n${room.sqft.toLocaleString()} sf${room.dimensions ? ` (${room.dimensions})` : ""}`
+          ? `${room.name}\n${room.sqft.toLocaleString()} sf${room.dimensions ? `\n${room.dimensions}` : ""}`
           : room.name;
 
         return (
@@ -275,26 +261,23 @@ function RoomLabels({ floor }: { floor: FloorDef }) {
             <Text
               position={[cx, 0, cz]}
               rotation={[-Math.PI / 2, 0, 0]}
-              fontSize={0.3}
+              fontSize={0.25}
               color={floor.accentColor}
               anchorX="center"
               anchorY="middle"
-              maxWidth={room.w * 0.9}
+              maxWidth={room.w * 0.85}
               textAlign="center"
               lineHeight={1.4}
             >
               {label}
             </Text>
-            {/* Floor tint for the room area */}
-            <mesh
-              position={[cx, -0.28, cz]}
-              rotation={[-Math.PI / 2, 0, 0]}
-            >
+            {/* Room area tint */}
+            <mesh position={[cx, -0.28, cz]} rotation={[-Math.PI / 2, 0, 0]}>
               <planeGeometry args={[room.w - 0.02, room.h - 0.02]} />
               <meshStandardMaterial
                 color={room.color}
                 transparent
-                opacity={0.15}
+                opacity={0.2}
                 side={THREE.DoubleSide}
               />
             </mesh>
@@ -306,7 +289,7 @@ function RoomLabels({ floor }: { floor: FloorDef }) {
 }
 
 // ---------------------------------------------------------------------------
-// Coffered ceiling for the first floor (auditorium)
+// Coffered ceiling for the auditorium
 // ---------------------------------------------------------------------------
 function CofferedCeiling({ floor }: { floor: FloorDef }) {
   const auditorium = floor.rooms.find((r) => r.id === "1-auditorium");
@@ -316,31 +299,25 @@ function CofferedCeiling({ floor }: { floor: FloorDef }) {
   const halfD = BUILDING_DEPTH / 2;
   const cx = auditorium.x - halfW;
   const cz = auditorium.y - halfD;
-  const ceilingY = floor.elevation + FLOOR_HEIGHT - 0.05;
+  const ceilingY = FLOOR_HEIGHT - 0.05;
 
   const beamDepth = 0.08;
   const beamWidth = 0.06;
   const spacingX = auditorium.w / 6;
   const spacingZ = auditorium.h / 8;
-
   const beams: React.ReactNode[] = [];
 
-  // Beams running along X (across width)
   for (let i = 0; i <= 8; i++) {
-    const z = cz + i * spacingZ;
     beams.push(
-      <mesh key={`cx-${i}`} position={[cx + auditorium.w / 2, ceilingY, z]}>
+      <mesh key={`cx-${i}`} position={[cx + auditorium.w / 2, ceilingY, cz + i * spacingZ]}>
         <boxGeometry args={[auditorium.w, beamDepth, beamWidth]} />
         <meshStandardMaterial color="#F0EBE0" roughness={0.85} />
       </mesh>
     );
   }
-
-  // Beams running along Z (across depth)
   for (let i = 0; i <= 6; i++) {
-    const x = cx + i * spacingX;
     beams.push(
-      <mesh key={`cz-${i}`} position={[x, ceilingY, cz + auditorium.h / 2]}>
+      <mesh key={`cz-${i}`} position={[cx + i * spacingX, ceilingY, cz + auditorium.h / 2]}>
         <boxGeometry args={[beamWidth, beamDepth, auditorium.h]} />
         <meshStandardMaterial color="#F0EBE0" roughness={0.85} />
       </mesh>
@@ -351,10 +328,71 @@ function CofferedCeiling({ floor }: { floor: FloorDef }) {
 }
 
 // ---------------------------------------------------------------------------
-// Main component
+// Single floor plate component
 // ---------------------------------------------------------------------------
-// 2x2 spread layout offsets: [x, z] for each floor in the grid
-const SPREAD_GAP = 2; // meters between floor plans
+function FloorPlate({
+  floor,
+  yPosition,
+  visible,
+  dimmed,
+  slabGeometry,
+  floorTexture,
+}: {
+  floor: FloorDef;
+  yPosition: number;
+  visible: boolean;
+  dimmed: boolean;
+  slabGeometry: THREE.BufferGeometry;
+  floorTexture: THREE.CanvasTexture;
+}) {
+  if (!visible) return null;
+
+  const opacity = dimmed ? 0.15 : 1;
+
+  return (
+    <group position={[0, yPosition, 0]}>
+      {/* Floor slab */}
+      <mesh geometry={slabGeometry}>
+        <meshStandardMaterial
+          map={floorTexture}
+          roughness={0.6}
+          transparent={dimmed}
+          opacity={opacity}
+        />
+      </mesh>
+
+      {/* Exterior outline walls */}
+      <FloorOutline floor={floor} />
+
+      {/* Interior partition walls */}
+      <RoomWalls floor={floor} opacity={opacity} />
+
+      {/* Room labels + tints */}
+      <RoomLabels floor={floor} />
+
+      {/* Coffered ceiling for first floor */}
+      {floor.id === "1" && <CofferedCeiling floor={floor} />}
+
+      {/* Floor title label */}
+      <Text
+        position={[0, SLAB_THICKNESS + 0.05, -BUILDING_DEPTH / 2 - 1.0]}
+        rotation={[-Math.PI / 4, 0, 0]}
+        fontSize={0.5}
+        color={floor.accentColor}
+        anchorX="center"
+        anchorY="middle"
+        fontWeight={700}
+      >
+        {floor.name} — {floor.subtitle}
+      </Text>
+    </group>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Spread layout positions (2x2 grid)
+// ---------------------------------------------------------------------------
+const SPREAD_GAP = 2;
 const SPREAD_POSITIONS: Record<string, [number, number]> = {
   "LL": [-(BUILDING_WIDTH / 2 + SPREAD_GAP / 2), -(BUILDING_DEPTH / 2 + SPREAD_GAP / 2)],
   "1":  [ (BUILDING_WIDTH / 2 + SPREAD_GAP / 2), -(BUILDING_DEPTH / 2 + SPREAD_GAP / 2)],
@@ -362,69 +400,67 @@ const SPREAD_POSITIONS: Record<string, [number, number]> = {
   "R":  [ (BUILDING_WIDTH / 2 + SPREAD_GAP / 2),  (BUILDING_DEPTH / 2 + SPREAD_GAP / 2)],
 };
 
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 export function InteriorFloors({
   selectedFloor,
-  showAllFloors,
-  opacity = 1,
-  isolateMode = false,
   spreadView = false,
 }: InteriorFloorsProps) {
   const floorTexture = useMemo(() => createFloorTexture(), []);
   const slabGeometry = useMemo(() => createLShapedSlabGeometry(), []);
 
-  const visibleFloors = useMemo(() => {
-    if (spreadView) return floors; // show all in spread
-    if (isolateMode && selectedFloor) {
-      return floors.filter((f) => f.id === selectedFloor);
-    }
-    if (showAllFloors) return floors;
-    if (selectedFloor) return floors.filter((f) => f.id === selectedFloor);
-    return floors;
-  }, [selectedFloor, showAllFloors, isolateMode, spreadView]);
-
-  // In spread or isolate mode, flatten to y=0
-  const flatMode = spreadView || isolateMode;
-
   return (
     <group>
-      {visibleFloors.map((floor) => {
-        if (flatMode) {
-          // Spread or isolate: position each floor flat at y=0, offset in XZ for spread
-          const spreadOffset = spreadView ? (SPREAD_POSITIONS[floor.id] ?? [0, 0]) : [0, 0];
-          const flatFloor = { ...floor, elevation: 0 };
+      {FLOOR_ORDER.map((floorId, index) => {
+        const floor = floors.find((f) => f.id === floorId);
+        // For roof, create a minimal FloorDef
+        const floorDef: FloorDef = floor ?? {
+          id: "R",
+          name: "Roof",
+          subtitle: "The Crown",
+          elevation: 0,
+          color: "#334155",
+          accentColor: "#94a3b8",
+          rooms: [],
+        };
+
+        const isSelected = selectedFloor === floorId;
+        const hasSelection = selectedFloor !== null;
+        // When a floor is selected, hide others; when none selected show all
+        const visible = !hasSelection || isSelected;
+        const dimmed = false; // not used in this mode
+
+        if (spreadView) {
+          const offset = SPREAD_POSITIONS[floorId] ?? [0, 0];
           return (
-            <group key={floor.id} position={[spreadOffset[0], 0, spreadOffset[1]]}>
-              <mesh geometry={slabGeometry}>
-                <meshStandardMaterial map={floorTexture} roughness={0.6} />
-              </mesh>
-              <RoomWalls floor={flatFloor} opacity={1} />
-              <RoomLabels floor={flatFloor} />
-              {floor.id === "1" && <CofferedCeiling floor={flatFloor} />}
-              <Text
-                position={[0, 0.05, -BUILDING_DEPTH / 2 - 0.8]}
-                rotation={[-Math.PI / 2, 0, 0]}
-                fontSize={0.6}
-                color={floor.accentColor}
-                anchorX="center"
-                anchorY="middle"
-                fontWeight={700}
-              >
-                {floor.name} — {floor.subtitle}
-              </Text>
+            <group key={floorId} position={[offset[0], 0, offset[1]]}>
+              <FloorPlate
+                floor={floorDef}
+                yPosition={0}
+                visible={!hasSelection || isSelected}
+                dimmed={false}
+                slabGeometry={slabGeometry}
+                floorTexture={floorTexture}
+              />
             </group>
           );
         }
 
-        // Normal stacked view: use real elevations, no wrapper offset
+        // Stacked exploded view — evenly spaced regardless of which are visible
+        // Each floor always occupies its slot position
+        const yPosition = index * SLOT_HEIGHT;
+
         return (
-          <React.Fragment key={floor.id}>
-            <mesh geometry={slabGeometry} position={[0, floor.elevation, 0]}>
-              <meshStandardMaterial map={floorTexture} roughness={0.6} />
-            </mesh>
-            <RoomWalls floor={floor} opacity={1} />
-            <RoomLabels floor={floor} />
-            {floor.id === "1" && <CofferedCeiling floor={floor} />}
-          </React.Fragment>
+          <FloorPlate
+            key={floorId}
+            floor={floorDef}
+            yPosition={yPosition}
+            visible={visible}
+            dimmed={false}
+            slabGeometry={slabGeometry}
+            floorTexture={floorTexture}
+          />
         );
       })}
     </group>

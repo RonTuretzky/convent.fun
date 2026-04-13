@@ -4,9 +4,14 @@
     {
       "name": "building-3d",
       "runtimeExecutable": "/Users/wk/.bun/bin/bun",
-      "runtimeArgs": ["run", "dev"],
-      "cwd": "apps/building-3d",
+      "runtimeArgs": ["--cwd", "apps/building-3d", "run", "dev"],
       "port": 3004
+    },
+    {
+      "name": "static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8080"],
+      "port": 8080
     }
   ]
 }
